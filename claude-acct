@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""claude-acct — hot-swap the Claude Code login while Claude Code is running.
+
+Linux stores the active OAuth login in <config>/.credentials.json and Claude
+Code re-reads it when the file's mtime changes, so swapping that file (plus
+the `oauthAccount` identity block in ~/.claude.json) switches accounts on the
+next message — no restart needed.
+
+The one real trap: refresh tokens ROTATE. While an account is active, Claude
+Code refreshes its token and the old refresh token dies. So before swapping
+an account out we always copy the live credentials back into its slot;
+otherwise the slot holds a dead token and the next switch to it fails.
+
+Usage:
+  claude-acct save <name>        store the currently logged-in account as <name>
+  claude-acct switch [name]      switch to <name> (no name: rotate to the next)
+  claude-acct list               show stored accounts, mark the active one
+  claude-acct status             show the active account
+  claude-acct remove <name>      delete a stored account
+  claude-acct auto [--threshold 90] [--interval 120] [--once]
+                                 watch usage; switch when 5h or 7d hits threshold
+  claude-acct bar                one-line status (active account + cached usage)
+
+Adding a second account: in Claude Code run /login (NOT /logout) with the
+other account, then `claude-acct save <name>`.
+"""
+
+import json
+import os
+import random
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager, ExitStack
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
+# With CLAUDE_CONFIG_DIR set, Claude Code keeps .claude.json inside that dir.
+GLOBAL_CONFIG = (
+    CONFIG_DIR / ".claude.json" if "CLAUDE_CONFIG_DIR" in os.environ else HOME / ".claude.json"
+)
+LIVE_CREDS = CONFIG_DIR / ".credentials.json"
+STORE = HOME / ".claude-accounts"
+USAGE_CACHE = STORE / ".usage.json"
+
+# Claude Code's own proper-lockfile locks (mkdir-based). Holding them means a
+# swap can never land in the middle of Claude Code's token refresh, which
+# would otherwise overwrite our swap with the old account's refreshed token.
+CRED_LOCKS = [CONFIG_DIR / ".oauth_refresh.lock", CONFIG_DIR.parent / (CONFIG_DIR.name + ".lock")]
+CONFIG_LOCK = GLOBAL_CONFIG.parent / (GLOBAL_CONFIG.name + ".lock")
+
+
+def die(msg):
+    print(f"claude-acct: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+@contextmanager
+def dir_lock(path, stale, timeout=20.0):
+    start = time.monotonic()
+    while True:
+        try:
+            os.mkdir(path)
+            break
+        except FileExistsError:
+            pass
+        if time.monotonic() - start > timeout:
+            die(f"timed out waiting for {path} (Claude Code busy refreshing?) — retry")
+        try:
+            if time.time() - os.stat(path).st_mtime > stale:
+                os.rmdir(path)  # dead holder
+                continue
+        except OSError:
+            continue
+        time.sleep(0.25 + random.random() * 0.25)
+
+    stop = threading.Event()
+
+    def touch():
+        while not stop.wait(3.0):
+            try:
+                os.utime(path)
+            except OSError:
+                return
+
+    t = threading.Thread(target=touch, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(1.0)
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+
+@contextmanager
+def claude_locks():
+    with ExitStack() as stack:
+        for p in CRED_LOCKS:
+            stack.enter_context(dir_lock(p, stale=60.0))
+        stack.enter_context(dir_lock(CONFIG_LOCK, stale=10.0))
+        yield
+
+
+def atomic_write(path, data: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_config():
+    try:
+        return json.loads(GLOBAL_CONFIG.read_text())
+    except FileNotFoundError:
+        die(f"{GLOBAL_CONFIG} not found — log in to Claude Code first")
+    except json.JSONDecodeError:
+        die(f"{GLOBAL_CONFIG} is unreadable — refusing to touch it")
+
+
+def live_email():
+    return (read_config().get("oauthAccount") or {}).get("emailAddress")
+
+
+def slots():
+    if not STORE.is_dir():
+        return []
+    return sorted(p for p in STORE.iterdir() if (p / "credentials.json").is_file())
+
+
+def slot_email(slot):
+    try:
+        return json.loads((slot / "oauthAccount.json").read_text()).get("emailAddress")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def slot_for_email(email):
+    for s in slots():
+        if email and slot_email(s) == email:
+            return s
+    return None
+
+
+def capture_live_into(slot):
+    """Copy the live login (creds + identity) into a slot."""
+    if not LIVE_CREDS.is_file():
+        die(f"{LIVE_CREDS} not found — is Claude Code logged in?")
+    oauth = read_config().get("oauthAccount")
+    if not oauth:
+        die("no oauthAccount in config — is Claude Code logged in with a claude.ai account?")
+    slot.mkdir(parents=True, exist_ok=True)
+    os.chmod(STORE, 0o700)
+    os.chmod(slot, 0o700)
+    atomic_write(slot / "credentials.json", LIVE_CREDS.read_text())
+    atomic_write(slot / "oauthAccount.json", json.dumps(oauth, indent=2))
+
+
+def cmd_save(name):
+    slot = STORE / name
+    other = slot_for_email(live_email())
+    if other and other != slot:
+        die(f"{live_email()} is already stored as '{other.name}'")
+    with claude_locks():
+        capture_live_into(slot)
+    print(f"saved {live_email()} as '{name}'")
+
+
+def cmd_switch(name=None):
+    all_slots = slots()
+    if not all_slots:
+        die("no accounts stored — run `claude-acct save <name>` first")
+    current = slot_for_email(live_email())
+    if name is None:
+        if current is None:
+            die("active account isn't stored; save it first or name a target")
+        target = all_slots[(all_slots.index(current) + 1) % len(all_slots)]
+    else:
+        target = STORE / name
+        if target not in all_slots:
+            die(f"no account named '{name}' (have: {', '.join(s.name for s in all_slots)})")
+    if target == current:
+        print(f"already on '{target.name}' ({live_email()})")
+        return
+
+    with claude_locks():
+        # 1. Save the outgoing account's (possibly rotated) token back.
+        if current is not None:
+            capture_live_into(current)
+        elif LIVE_CREDS.is_file():
+            backup = STORE / f".unsaved-{int(time.time())}.credentials.json"
+            atomic_write(backup, LIVE_CREDS.read_text())
+            print(f"warning: active login wasn't stored; backed it up to {backup}")
+        # 2. Swap in the target's credentials (mtime bump -> hot reload).
+        atomic_write(LIVE_CREDS, (target / "credentials.json").read_text())
+        # 3. Splice the target identity into ~/.claude.json, keeping everything else.
+        cfg = read_config()
+        cfg["oauthAccount"] = json.loads((target / "oauthAccount.json").read_text())
+        atomic_write(GLOBAL_CONFIG, json.dumps(cfg, indent=2))
+
+    print(f"switched: {current.name if current else '?'} -> {target.name} ({slot_email(target)})")
+    print("takes effect on Claude Code's next message (first one may rebuild cache)")
+
+
+def parse_reset(ts):
+    """ISO timestamp from the usage API -> epoch seconds (None if absent)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fetch_usage(creds_text):
+    """Return (5h %, 7d %, 5h reset, 7d reset) for a credential, or None if it can't be checked.
+
+    Only uses an unexpired access token — never refreshes, since refreshing
+    rotates the token out from under Claude Code / the stored slot.
+    """
+    try:
+        oauth = json.loads(creds_text)["claudeAiOauth"]
+        if oauth.get("expiresAt", 0) / 1000 < time.time() + 60:
+            return None
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={"Authorization": f"Bearer {oauth['accessToken']}",
+                     "anthropic-beta": "oauth-2025-04-20",
+                     "User-Agent": "claude-acct/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (OSError, KeyError, ValueError, urllib.error.URLError) as e:
+        log(f"usage check failed: {e}")
+        return None
+    pct = lambda k: float((data.get(k) or {}).get("utilization") or 0)
+    reset = lambda k: parse_reset((data.get(k) or {}).get("resets_at"))
+    return pct("five_hour"), pct("seven_day"), reset("five_hour"), reset("seven_day")
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def read_usage_cache():
+    try:
+        return json.loads(USAGE_CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_usage_cache(fresh):
+    """Merge new readings in; keep the last known value for accounts we couldn't check."""
+    cache = read_usage_cache()
+    for name, usage in fresh.items():
+        if usage is not None:
+            cache[name] = {"5h": usage[0], "7d": usage[1], "5h_reset": usage[2],
+                           "7d_reset": usage[3], "at": time.time()}
+    cache = {k: v for k, v in cache.items() if (STORE / k).is_dir()}
+    atomic_write(USAGE_CACHE, json.dumps(cache))
+
+
+def gauge(label, pct, blocks=5):
+    """e.g. "5h ▰▰▱▱▱ 34%", or "7d ▰▰▰▰▰ FULL" once maxed out."""
+    filled = min(blocks, round(pct / (100 / blocks)))
+    value = "FULL" if pct >= 100 else f"{pct:.0f}%"
+    return f"{label} {'▰' * filled}{'▱' * (blocks - filled)} {value}"
+
+
+def current_pct(u, key):
+    """Cached %, zeroed once its window has reset since the reading."""
+    reset = u.get(f"{key}_reset")
+    return 0.0 if reset and time.time() >= reset else u[key]
+
+
+def cmd_bar():
+    """One status line for herdr's tab bar. Reads the cache only — no network.
+
+    Inactive accounts can't be re-checked once their access token expires (we
+    never refresh), but nothing is using them, so their usage only drops when a
+    window resets — which current_pct accounts for. Only the active account's
+    reading can go stale in a way that matters, so only it gets "(old)".
+    """
+    cache = read_usage_cache()
+    email = live_email()
+
+    parts = []
+    for s in slots():
+        u = cache.get(s.name)
+        active = slot_email(s) == email
+        if u:
+            nums = f"{gauge('5h', current_pct(u, '5h'))}  {gauge('7d', current_pct(u, '7d'))}"
+            if active and time.time() - u["at"] > 15 * 60:
+                nums += " (old)"
+        else:
+            nums = "no data"
+        mark = "●" if active else "○"
+        parts.append(f"{mark} {s.name.capitalize()}  {nums}")
+    print(" ┃ ".join(parts) if parts else "claude-acct: no accounts")
+
+
+def cmd_auto(args):
+    threshold, interval, once = 90.0, 120, False
+    it = iter(args)
+    for a in it:
+        if a == "--threshold":
+            threshold = float(next(it))
+        elif a == "--interval":
+            interval = int(next(it))
+        elif a == "--once":
+            once = True
+        else:
+            die(f"unknown option {a}")
+    log(f"auto-switch at {threshold:.0f}% (5h or 7d), checking every {interval}s")
+    while True:
+        current = slot_for_email(live_email())
+        # Check every account each round (the active one via the live creds)
+        # and cache the results for `claude-acct bar`.
+        fresh = {}
+        for s in slots():
+            creds = LIVE_CREDS if s == current else s / "credentials.json"
+            if creds.is_file():
+                fresh[s.name] = fetch_usage(creds.read_text())
+        write_usage_cache(fresh)
+        usage = fresh.get(current.name) if current else None
+        if current is None:
+            log("active account isn't stored — run `claude-acct save <name>`")
+        elif usage is None:
+            pass  # idle (token expired) or API hiccup; Claude Code refreshes on next use
+        elif max(usage[:2]) < threshold:
+            log(f"{current.name}: 5h {usage[0]:.0f}%  7d {usage[1]:.0f}%")
+        else:
+            log(f"{current.name} at 5h {usage[0]:.0f}% / 7d {usage[1]:.0f}% — looking for another account")
+            for target in slots():
+                if target == current:
+                    continue
+                t_usage = fresh.get(target.name)
+                if t_usage is not None and max(t_usage[:2]) >= threshold:
+                    log(f"  {target.name} also at 5h {t_usage[0]:.0f}% / 7d {t_usage[1]:.0f}% — skipping")
+                    continue
+                cmd_switch(target.name)
+                break
+            else:
+                log("  every account is over the threshold — staying put")
+        if once:
+            return
+        time.sleep(interval)
+
+
+def cmd_list():
+    email = live_email()
+    for s in slots():
+        mark = "*" if slot_email(s) == email else " "
+        print(f"{mark} {s.name:15} {slot_email(s) or '?'}")
+    if not slots():
+        print("no accounts stored")
+
+
+def cmd_status():
+    email = live_email()
+    s = slot_for_email(email)
+    print(f"{email or 'not logged in'}" + (f"  ('{s.name}')" if s else "  (not stored)"))
+
+
+def cmd_remove(name):
+    slot = STORE / name
+    if not slot.is_dir():
+        die(f"no account named '{name}'")
+    shutil.rmtree(slot)
+    print(f"removed '{name}' (the live login is untouched)")
+
+
+def main(argv):
+    cmds = {"save": (cmd_save, 1), "switch": (cmd_switch, None), "list": (cmd_list, 0),
+            "status": (cmd_status, 0), "remove": (cmd_remove, 1), "bar": (cmd_bar, 0)}
+    if argv[:1] == ["auto"]:
+        return cmd_auto(argv[1:])
+    if not argv or argv[0] not in cmds:
+        print(__doc__)
+        sys.exit(0 if argv[:1] in ([], ["-h"], ["--help"]) else 1)
+    fn, nargs = cmds[argv[0]]
+    args = argv[1:]
+    if nargs is not None and len(args) != nargs or nargs is None and len(args) > 1:
+        die(f"wrong arguments for '{argv[0]}'")
+    if args and ("/" in args[0] or args[0].startswith(".")):
+        die("account names can't contain '/' or start with '.'")
+    fn(*args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
